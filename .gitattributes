@@ -6,6 +6,10 @@
 *.yaml text eol=lf
 Dockerfile text eol=lf
 
+# 文档统一 LF：否则 Windows 侧 core.autocrlf 会把 README 存成 CRLF，
+# 后续每次编辑都产生「整文件都改了」的假 diff
+*.md text eol=lf
+
 # 二进制/归档文件不要做任何转换
 *.tar.gz binary
 *.gz binary
