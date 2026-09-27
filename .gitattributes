@@ -10,6 +10,11 @@ Dockerfile text eol=lf
 # 后续每次编辑都产生「整文件都改了」的假 diff
 *.md text eol=lf
 
+# 环境变量文件必须 LF —— .env 里带 \r 会让 docker compose
+# 解析出 "3g\r" 这类脏值，表现为莫名其妙的配置错误
+.env.example text eol=lf
+*.env text eol=lf
+
 # 二进制/归档文件不要做任何转换
 *.tar.gz binary
 *.gz binary
