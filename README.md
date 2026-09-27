@@ -1,0 +1,215 @@
+# aionui-arm64-builder
+
+在 **GitHub Actions 的 ARM64 runner** 上构建 AionUi Web 的 `linux/arm64` Docker 镜像，
+产出通过 Release 下载，在绿联 DH4300 Plus（RK3588 / ARM64 / 8GB 板载内存）上 `docker load` 运行。
+
+**目标机不参与构建** —— 绕开 8GB 内存 OOM 风险，也不需要 QEMU 跨架构模拟。
+
+---
+
+## 为什么不用上游自带的 Dockerfile
+
+AionUi v2.2.2 源码里的 `Dockerfile` 是**坏的**，第二步就会失败：
+
+| 上游 Dockerfile 写的 | 实际情况 |
+|---|---|
+| `RUN bun run build:renderer:web` | `package.json` 里**没有**这个 script |
+| `RUN node scripts/build-server.mjs` | `scripts/` 目录下**没有**这个文件 |
+
+上游在 v2.2.x 重构成 monorepo（`packages/*`）后，这份 Dockerfile 没有跟着更新。
+本仓库的 `Dockerfile` 依据 v2.2.2 源码里**真实存在**的构建链重写：
+
+```
+bun install
+bun run package                    → electron-vite 打包前端 SPA 到 out/renderer
+node scripts/pack-web-cli.js       → 编译单文件二进制 + 下载 AionCore + 打 tarball
+```
+
+`pack-web-cli.js` 内部会调 `prepareAioncore()`，从 `iOfficeAI/AionCore` 的 Release
+下载 **aarch64 预编译产物**（`aioncore-{tag}-aarch64-unknown-linux-gnu.tar.gz`），
+**不需要在构建时编译 Rust**，也不需要在 NAS 上装 Rust 工具链。
+
+---
+
+## 目录结构
+
+```
+.
+├── Dockerfile                              # 两阶段构建：builder(bun) → runtime(debian-slim)
+├── .github/workflows/
+│   └── build-aionui-arm64.yml              # GitHub Actions 工作流（核心）
+├── deploy/nas/
+│   ├── docker-compose.yml                  # NAS 侧运行编排
+│   └── .env.example                        # 环境变量模板
+├── scripts/
+│   └── nas-load-and-deploy.sh              # NAS 侧导入脚本（校验 + docker load）
+├── .gitattributes                          # 强制 .sh/.yml 用 LF
+├── .gitignore
+└── .dockerignore
+```
+
+---
+
+## 使用流程
+
+### 第 1 步：在 GitHub 上建仓库并推送
+
+```bash
+git init
+git add .
+git commit -m "build: AionUi ARM64 image workflow"
+git branch -M main
+git remote add origin https://github.com/<你的用户名>/aionui-arm64-builder.git
+git push -u origin main
+```
+
+> **仓库要设为 Public** —— 公开仓库的 ARM64 runner 免费不限量；
+> 私有仓库会消耗你账号的 Actions 分钟数。
+
+### 第 2 步：触发构建
+
+仓库页面 → **Actions** → 左侧选 `build-aionui-arm64` → **Run workflow** → 填参数：
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `aionui_version` | AionUi 版本 tag | `v2.2.2` |
+| `image_tag` | 构建出的镜像 tag | `2.2.2` |
+
+构建流程（约 8-15 分钟）：
+
+1. 拉取 `ubuntu-24.04-arm` runner（4 核 / 16GB / 原生 ARM64）
+2. `docker build` —— clone 源码 → `bun install` → `bun run package` → `pack-web-cli.js`
+3. **冒烟测试** —— 起容器，轮询 60 秒等 HTTP 就绪，失败直接判定构建失败
+4. `docker save | gzip` 导出，超过 1900MB 自动分卷
+5. 上传 artifact + 发布到 Release
+
+### 第 3 步：下载产物
+
+构建完成后，**Releases** 页面会出现 `aionui-arm64-2.2.2`，包含：
+
+```
+aionui-arm64-2.2.2.tar.gz          # 单文件归档（< 1.9GB 时）
+  — 或 —
+aionui-arm64-2.2.2.tar.gz.part-00  # 分卷（> 1.9GB 时）
+aionui-arm64-2.2.2.tar.gz.part-01
+SHA256SUMS                          # 校验和
+```
+
+### 第 4 步：传到 NAS 并导入
+
+在 NAS 终端里（SSH 或 UGOS 自带终端）：
+
+```bash
+# 方式 A：NAS 能直连 GitHub
+curl -LO https://github.com/<你的用户名>/aionui-arm64-builder/releases/download/aionui-arm64-2.2.2/aionui-arm64-2.2.2.tar.gz
+curl -LO https://github.com/<你的用户名>/aionui-arm64-builder/releases/download/aionui-arm64-2.2.2/SHA256SUMS
+
+# 方式 B：NAS 连不上 GitHub —— 在 Windows 上下好，用 UGOS 文件管理器传上去
+
+# 导入（脚本会先校验架构和 sha256，再 docker load）
+./nas-load-and-deploy.sh ./aionui-arm64-2.2.2.tar.gz
+```
+
+> 如果是分卷，把整个目录传给脚本即可：`./nas-load-and-deploy.sh ./dist`
+> 脚本会自动 `cat part-*` 合并。
+
+### 第 5 步：起容器
+
+```bash
+cd deploy/nas
+cp .env.example .env
+vi .env      # 【必须】把 AIONUI_DATA_DIR 改成你的 SATA 卷路径
+
+docker compose up -d
+docker compose logs -f --tail=50
+```
+
+浏览器访问 `http://<NAS的IP>:3000`。
+
+---
+
+## NAS 侧的关键约束
+
+### 数据目录必须落在 SATA 卷
+
+绿联 DH4300 Plus 的系统盘只有 **32GB eMMC**，Docker 数据写进去很快会满。
+
+`.env` 里的 `AIONUI_DATA_DIR` 要指向 SATA 卷，例如：
+
+```
+AIONUI_DATA_DIR=/volume1/docker/aionui
+```
+
+先确认挂载点（在 NAS 上执行）：
+
+```bash
+df -h | grep -E "volume|mnt"
+```
+
+### 内存分配
+
+RK3588 是 **8GB 板载内存、不可扩展**，且大概率还跑着别的 Docker 服务。
+`docker-compose.yml` 里给了 AionUi **3GB 上限 + 512MB 保底**。
+如果 NAS 上还有别的大内存服务，把这个上限再往下调。
+
+### 架构校验
+
+`nas-load-and-deploy.sh` 会先检查 `uname -m` 是不是 `aarch64`。
+在 x86 机器上导入这个镜像不会报错，但**容器启动时会 `exec format error`** ——
+脚本提前把这种情况拦掉。
+
+---
+
+## 排查
+
+### 构建阶段失败
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `bun install` 失败 | 上游 lockfile 与依赖树不一致 | 把 Dockerfile 里的 `--frozen-lockfile` 去掉重跑 |
+| `prepareAioncore()` 下载失败 | AionCore Release 地址变更 / 网络 | 看 CI 日志里的下载 URL，核对 `iOfficeAI/AionCore` 的 release assets |
+| `bun build --compile` 失败 | bun 版本与上游不匹配 | 调整 Dockerfile 首行 `FROM oven/bun:<版本>` |
+| 冒烟测试超时 | 二进制能编译但跑不起来 | 看 CI 日志里 `docker logs aionui-smoke` 的输出 |
+
+### 运行阶段失败
+
+```bash
+# 容器起不来 / 反复重启
+docker compose logs --tail=100 aionui
+
+# 确认镜像架构
+docker image inspect aionui:2.2.2 --format '{{.Architecture}}'   # 应为 arm64
+
+# 进容器看二进制是否存在
+docker run --rm --entrypoint sh aionui:2.2.2 -c 'ls -la /app'
+
+# 数据目录权限（容器内以 uid 1000 运行）
+ls -la /volume1/docker/aionui
+```
+
+### 关于 Office 预览功能
+
+上游为 Office 预览装了 `libicu-dev`，对应的是 .NET 系二进制。
+`iOfficeAI/OfficeCLI` 的 Release 里有 `officecli-linux-arm64` 资产，**arm64 是有的**，
+但这条链路能否在 RK3588 上完整跑通，**只能实际点击 Office 预览才知道**。
+如果这个功能报错，其余功能不受影响。
+
+---
+
+## 升级到新版本
+
+上游发新版时：
+
+1. Actions → Run workflow → `aionui_version` 填新 tag（如 `v2.2.3`）、`image_tag` 填 `2.2.3`
+2. 如果新版本改了构建链（`pack-web-cli.js` 路径变了、AionCore 命名规则变了），
+   Dockerfile 需要同步调整 —— 先 diff 上游的 `package.json` scripts 段和 `scripts/` 目录
+3. NAS 侧重新 `docker load` + 改 `.env` 里的 `AIONUI_IMAGE_TAG` + `docker compose up -d`
+
+---
+
+## 已知限制
+
+- 镜像基于 `debian:bookworm-slim`，体积约 **400-600MB**（含 AionCore 后端 + bun 单文件二进制）
+- 首次启动会初始化 SQLite 数据库，需要几十秒
+- 不使用 `czyt/aionui` 等第三方镜像 —— 来源与版本均不可控
+- 不使用上游 Dockerfile —— 已确认损坏
