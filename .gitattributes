@@ -1,0 +1,14 @@
+# 强制 shell 脚本使用 LF，避免 Windows 侧 core.autocrlf 污染
+*.sh text eol=lf
+
+# YAML / Dockerfile 也用 LF，Docker 解析对 CRLF 敏感
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+
+# 二进制/归档文件不要做任何转换
+*.tar.gz binary
+*.gz binary
+*.png binary
+*.jpg binary
+*.ico binary
