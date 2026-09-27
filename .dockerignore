@@ -1,0 +1,13 @@
+# 构建上下文里不需要的东西 —— 保持 context 极小，加速 CI
+.git
+.github
+deploy
+docs
+*.md
+dist
+dist-web-cli
+out
+data
+.env
+*.log
+.DS_Store
