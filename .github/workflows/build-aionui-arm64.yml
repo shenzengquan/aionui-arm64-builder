@@ -119,12 +119,26 @@ jobs:
 
       - name: Smoke test image
         run: |
-          set -eux
-          # 起容器，等待端口就绪，验证二进制能跑起来
-          docker run -d --name aionui-smoke \
-            -p 13000:3000 \
-            -e AIONUI_ALLOW_REMOTE=true \
-            ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          set -ux
+          IMG="${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}"
+
+          # 先做静态自检：确认入口文件存在且可执行。
+          # 这一步能把"CMD 指向目录"之类的镜像结构问题直接点出来，
+          # 而不是让 docker run 报一句难懂的 OCI runtime 错误。
+          echo "=== 镜像内产物布局 ==="
+          docker run --rm --entrypoint sh "$IMG" -c 'ls -la /app; echo "--- 入口类型 ---"; stat -c "%F %A %n" /app/aionui-web' || true
+
+          echo "=== 冒烟启动 ==="
+          # 不用 set -e 中断：先拿到失败原因再决定退出
+          if ! docker run -d --name aionui-smoke \
+                 -p 13000:3000 \
+                 -e AIONUI_ALLOW_REMOTE=true \
+                 "$IMG"; then
+            echo "::error::docker run 启动失败，见上方错误"
+            echo "--- 尝试打印容器日志 ---"
+            docker logs aionui-smoke 2>&1 | tail -50 || true
+            exit 1
+          fi
 
           ok=0
           for i in $(seq 1 30); do

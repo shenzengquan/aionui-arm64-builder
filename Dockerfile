@@ -123,12 +123,31 @@ RUN set -eux; \
       echo "::error::pack-web-cli.js 超时或失败（15 分钟上限），检查 AionCore 下载地址是否可达"; exit 1; }
 
 # 归一化产物名，后续阶段不依赖具体版本号
+#
+# 重要：pack-web-cli.js 用 `tar -C stagingDir aionui-web` 打包，
+# 所以 tarball 里的结构是：
+#     aionui-web/                     <- 顶层目录
+#       ├── aionui-web                <- 真正的单文件可执行二进制
+#       ├── package.json
+#       ├── static/                   <- SPA 前端资源
+#       └── bundled-aioncore/linux-arm64/
+# 解压后必须取内层 `aionui-web/` 的内容作为应用根，
+# 否则 /app/aionui-web 会是个目录，启动时报
+#     exec: "/app/aionui-web": is a directory: permission denied
 RUN set -eux; \
     mkdir -p /out; \
     tarball=$(ls dist-web-cli/aionui-web-*-linux-arm64.tar.gz | head -n 1); \
     echo "packed: ${tarball}"; \
     tar -xzf "${tarball}" -C /out; \
-    ls -la /out
+    echo "=== tarball 解压后的顶层结构 ==="; \
+    ls -la /out; \
+    ls -la /out/aionui-web; \
+    test -f /out/aionui-web/aionui-web || { \
+      echo "::error::未找到可执行文件 /out/aionui-web/aionui-web，tarball 结构与预期不符"; exit 1; }; \
+    chmod +x /out/aionui-web/aionui-web; \
+    echo "=== 可执行文件确认（架构 + 大小） ==="; \
+    file /out/aionui-web/aionui-web 2>/dev/null || true; \
+    ls -lh /out/aionui-web/aionui-web
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime —— 极简运行时，只带产物，不带构建工具链
@@ -159,11 +178,27 @@ RUN groupadd -g 1000 aionui \
 
 WORKDIR /app
 
-COPY --from=builder --chown=1000:1000 /out/ /app/
+# 注意源路径末尾的 `aionui-web/`：
+# 把 tarball 内层目录的【内容】铺到 /app，
+# 使得可执行文件落在 /app/aionui-web（而不是 /app/aionui-web/aionui-web）
+# 同级的 static/ 与 bundled-aioncore/ 也一并落在 /app 下，保持相对路径不变。
+COPY --from=builder --chown=1000:1000 /out/aionui-web/ /app/
 
 # 数据目录：必须挂到 SATA 卷，不要落在 32GB eMMC 上
 RUN mkdir -p /data && chown -R 1000:1000 /data
 VOLUME ["/data"]
+
+# 构建期自检：确保入口文件和关键产物都就位。
+# 放在这里可以让问题在 docker build 阶段就暴露，而不是拖到冒烟测试
+# （曾因 /app/aionui-web 是目录而非文件，导致容器启动报
+#   exec: "/app/aionui-web": is a directory: permission denied）
+RUN set -eux; \
+    test -f /app/aionui-web || { echo "::error::缺少入口文件 /app/aionui-web"; exit 1; }; \
+    test -x /app/aionui-web || { echo "::error::/app/aionui-web 不可执行"; exit 1; }; \
+    test -d /app/static || { echo "::error::缺少前端资源 /app/static"; exit 1; }; \
+    test -d /app/bundled-aioncore || { echo "::error::缺少后端 /app/bundled-aioncore"; exit 1; }; \
+    echo "=== runtime 产物自检通过 ==="; \
+    ls -la /app
 
 USER 1000:1000
 
