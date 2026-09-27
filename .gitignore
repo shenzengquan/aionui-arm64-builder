@@ -1,0 +1,13 @@
+# 部署时生成的本地配置
+deploy/nas/.env
+
+# 本地构建/测试产物
+dist/
+dist-web-cli/
+out/
+data/
+*.log
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
