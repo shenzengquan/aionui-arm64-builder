@@ -1,0 +1,185 @@
+# =============================================================================
+# 在 GitHub 托管的 ARM64 runner 上构建 AionUi Web 镜像
+# =============================================================================
+# 为什么用这个方案：
+#   - 目标机（绿联 DH4300 Plus / RK3588 / 8GB 板载内存）构建会 OOM
+#   - GitHub 官方 linux-arm64 runner（ubuntu-24.04-arm）4C/16GB，
+#     公开仓库免费不限量，ARM64 原生，不需要 QEMU 模拟
+#   - 产物直接通过 Release 下载，NAS 侧只需 docker load，不碰构建
+#
+# 产物：
+#   1) aionui-arm64-<tag>.tar.gz        单文件镜像归档（<2GB 时）
+#   2) aionui-arm64-<tag>.tar.gz.part-* 分卷（>2GB 时，GitHub 单文件上限）
+#   3) aionui-web-<version>-linux-arm64.tar.gz  上游 web 包（备用，可直接跑）
+#   4) SHA256SUMS                       校验和
+# =============================================================================
+
+name: build-aionui-arm64
+
+on:
+  workflow_dispatch:
+    inputs:
+      aionui_version:
+        description: 'AionUi version tag (e.g. v2.2.2)'
+        required: true
+        default: 'v2.2.2'
+      image_tag:
+        description: 'Docker image tag to use for the built image'
+        required: true
+        default: '2.2.2'
+  push:
+    tags:
+      - 'build-*'
+
+permissions:
+  contents: write
+
+env:
+  IMAGE_NAME: aionui
+
+jobs:
+  build:
+    # ARM64 原生 runner，公开仓库免费不限量
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Resolve inputs
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            AIONUI_VERSION="${{ inputs.aionui_version }}"
+            IMAGE_TAG="${{ inputs.image_tag }}"
+          else
+            # push tag 形如 build-v2.2.2 -> 解析出版本
+            AIONUI_VERSION="${GITHUB_REF_NAME#build-}"
+            IMAGE_TAG="${AIONUI_VERSION#v}"
+          fi
+          echo "aionui_version=${AIONUI_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved AionUi version: ${AIONUI_VERSION}"
+          echo "Resolved image tag: ${IMAGE_TAG}"
+
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Show runner info
+        run: |
+          echo "arch: $(uname -m)"
+          echo "nproc: $(nproc)"
+          free -h
+          docker version
+
+      # ----------------------------------------------------------------
+      # 1) 构建 Docker 镜像（ARM64 原生，无 QEMU）
+      # ----------------------------------------------------------------
+      - name: Build ARM64 image
+        run: |
+          docker build \
+            --platform linux/arm64 \
+            --build-arg AIONUI_VERSION=${{ steps.vars.outputs.aionui_version }} \
+            -t ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }} \
+            -f Dockerfile \
+            .
+
+      - name: Smoke test image
+        run: |
+          set -eux
+          # 起容器，等待端口就绪，验证二进制能跑起来
+          docker run -d --name aionui-smoke \
+            -p 13000:3000 \
+            -e AIONUI_ALLOW_REMOTE=true \
+            ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:13000/ >/dev/null 2>&1; then
+              echo "health check passed after ${i}s"
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- container logs ---"
+          docker logs aionui-smoke 2>&1 | tail -50 || true
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::容器启动后 60s 内 HTTP 未就绪，构建产物可能有问题"
+            exit 1
+          fi
+
+          # 确认架构正确
+          docker exec aionui-smoke uname -m || true
+
+      - name: Stop smoke container
+        if: always()
+        run: docker rm -f aionui-smoke || true
+
+      # ----------------------------------------------------------------
+      # 2) 导出镜像为 tar.gz，并按需分卷（GitHub 单文件 2GB 上限）
+      # ----------------------------------------------------------------
+      - name: Export image
+        id: export
+        run: |
+          set -eux
+          TAG="${{ steps.vars.outputs.image_tag }}"
+          mkdir -p dist
+
+          docker save ${{ env.IMAGE_NAME }}:${TAG} | gzip -1 > dist/aionui-arm64-${TAG}.tar.gz
+          ls -lh dist/
+
+          SIZE=$(stat -c%s dist/aionui-arm64-${TAG}.tar.gz)
+          LIMIT=$((1900 * 1024 * 1024))  # 留安全余量，1900MB
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "archive exceeds limit, splitting..."
+            split -b 1800m -d -a 2 dist/aionui-arm64-${TAG}.tar.gz dist/aionui-arm64-${TAG}.tar.gz.part-
+            rm -f dist/aionui-arm64-${TAG}.tar.gz
+            echo "split=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "split=0" >> "$GITHUB_OUTPUT"
+          fi
+
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      # ----------------------------------------------------------------
+      # 3) 上传为 workflow artifact（临时，30 天）
+      # ----------------------------------------------------------------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aionui-arm64-${{ steps.vars.outputs.image_tag }}
+          path: dist/*
+          retention-days: 30
+
+      # ----------------------------------------------------------------
+      # 4) 发布到 Release（长期可下载，NAS 侧 curl 直取）
+      # ----------------------------------------------------------------
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: aionui-arm64-${{ steps.vars.outputs.image_tag }}
+          name: AionUi ${{ steps.vars.outputs.aionui_version }} ARM64 image
+          body: |
+            AionUi Web ${{ steps.vars.outputs.aionui_version }} for linux/arm64.
+
+            构建方式：GitHub Actions `ubuntu-24.04-arm` 原生 ARM64 构建，
+            绕过上游 v2.2.2 中已失效的 Dockerfile。
+
+            ### NAS 侧部署
+            ```bash
+            # 单文件归档
+            curl -LO https://github.com/${{ github.repository }}/releases/download/aionui-arm64-${{ steps.vars.outputs.image_tag }}/aionui-arm64-${{ steps.vars.outputs.image_tag }}.tar.gz
+            gunzip -c aionui-arm64-${{ steps.vars.outputs.image_tag }}.tar.gz | docker load
+
+            # 若是分卷，先合并
+            # cat aionui-arm64-${{ steps.vars.outputs.image_tag }}.tar.gz.part-* > aionui-arm64-${{ steps.vars.outputs.image_tag }}.tar.gz
+            # gunzip -c aionui-arm64-${{ steps.vars.outputs.image_tag }}.tar.gz | docker load
+            ```
+          files: dist/*
+          generate_release_notes: false
+          draft: false
+          prerelease: false
