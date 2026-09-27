@@ -1,0 +1,56 @@
+# =============================================================================
+# AionUi Web - 绿联 DH4300 Plus (RK3588 / ARM64) 离线部署
+# =============================================================================
+# 前提：镜像已经通过 docker load 导入（见 README 第 4 步）
+#
+# 铁律：数据目录必须落在 SATA 卷，不要写进 32GB eMMC。
+#   - 绿联 UGOS 常见挂载点：/volume1 /volume2 /volume3 ...
+#   - 下面用 ${AIONUI_DATA_DIR} 变量占位，部署时在 .env 里填真实路径
+# =============================================================================
+
+services:
+  aionui:
+    image: aionui:${AIONUI_IMAGE_TAG:-2.2.2}
+    container_name: aionui
+    restart: unless-stopped
+
+    # 离线部署：镜像本地已有，禁止尝试拉取
+    pull_policy: never
+
+    ports:
+      # 左侧为 NAS 暴露端口，可按需改
+      - "${AIONUI_PORT:-3000}:3000"
+
+    volumes:
+      # 数据目录 -> SATA 卷（必须，不要用 eMMC）
+      - ${AIONUI_DATA_DIR:-./data}:/data
+
+    environment:
+      AIONUI_PORT: "3000"
+      AIONUI_ALLOW_REMOTE: "true"
+      AIONUI_DATA_DIR: "/data"
+      AIONUI_LOG_DIR: "/data/logs"
+      TZ: "${TZ:-Asia/Shanghai}"
+      NODE_ENV: "production"
+
+    # 资源上限：RK3588 8GB 板载内存，给 AionUi 留足但别吃满整机
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+        reservations:
+          memory: 512m
+
+    # 日志轮转，避免长跑把 SATA 写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
