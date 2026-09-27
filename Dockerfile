@@ -43,6 +43,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# ---------------------------------------------------------------------------
+# 关键修复：让容器内的 CI 语义与上游 CI 一致
+# ---------------------------------------------------------------------------
+# 上游 package.json 的 postinstall（scripts/postinstall.js）会判断：
+#     isCI = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true'
+#   - isCI 为真 → 跳过重建，直接用预编译二进制（上游 CI 走的就是这条路）
+#   - isCI 为假 → 执行 bunx electron-builder install-app-deps
+#                并带 npm_config_build_from_source=true（从源码重建原生模块）
+#
+# 坑：docker build 不会把宿主机的环境变量带进容器，
+#     所以在 Actions runner 里跑 docker build 时，容器内 CI/GITHUB_ACTIONS 都是空的，
+#     postinstall 会误判为"本地环境"，去跑 electron-builder 从源码重建 —— 
+#     这一步在 ARM64 上会长时间静默卡死（实测挂满 900s 无任何输出）。
+#
+# 显式设 CI=true，让容器内行为与上游 CI 对齐。
+ENV CI=true
+
+# 优先走 IPv4：GitHub runner 上 registry.npmjs.org 有时只解析出 IPv6，
+# 而 IPv6 出口不通会造成"连接建立后静默挂起"（无报错、无超时）。
+RUN echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
+
+# 我们只构建 web CLI，不需要 Electron 运行时；
+# 跳过 Electron 二进制下载，避免另一个大体积下载成为挂死源。
+ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
+
 WORKDIR /build
 
 # 拉取指定版本的源码。--depth 1 只取该 tag 的快照，不拉 4400+ commits 历史
@@ -58,11 +83,27 @@ RUN set -eux; \
 
 WORKDIR /build/src
 
-# 安装依赖。--frozen-lockfile 保证与上游 lockfile 一致，避免依赖漂移
-# timeout 900: 超过 15 分钟未完成即视为卡死，直接失败而不是无限等待
+# 容器内出网自检：确认 registry 可达，并打印实际使用的出口 IP 版本
+# （若 remote_ip 是 IPv6 且随后安装挂死，即可确认是 IPv6 出口问题）
 RUN set -eux; \
-    timeout 900 bun install --frozen-lockfile || { \
-      echo "::error::bun install 超时或失败（15 分钟上限）"; exit 1; }
+    echo "=== in-container 出网自检 ==="; \
+    getent ahosts registry.npmjs.org | head -n 6 || true; \
+    curl -sS -o /dev/null -m 20 \
+      -w 'registry.npmjs.org -> HTTP %{http_code}, remote_ip=%{remote_ip}\n' \
+      https://registry.npmjs.org/ || true
+
+# 安装依赖。--frozen-lockfile 保证与上游 lockfile 一致，避免依赖漂移
+# --verbose: 打印每个包的解析/下载细节 —— 万一再挂死，日志能直接指出卡在哪个包
+# 重试 2 次：网络偶发挂起时给一次重来的机会
+# timeout 600: 单次超过 10 分钟无进展即判定挂死
+RUN set -eux; \
+    for i in 1 2; do \
+      timeout 600 bun install --frozen-lockfile --verbose && break; \
+      echo "!! bun install 第 ${i} 次超时/失败，20s 后重试"; \
+      sleep 20; \
+    done; \
+    test -d node_modules || { \
+      echo "::error::bun install 两次均失败（见上方 verbose 输出定位卡点）"; exit 1; }
 
 # 前端 SPA 打包 -> out/renderer
 RUN set -eux; \

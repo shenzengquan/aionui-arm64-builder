@@ -42,8 +42,9 @@ jobs:
     # ARM64 原生 runner，公开仓库免费不限量
     runs-on: ubuntu-24.04-arm
 
-    # 硬性超时：卡死自动失败，不干等。正常构建 8-15 分钟，给 45 分钟余量。
-    timeout-minutes: 45
+    # 硬性超时：卡死自动失败，不干等。
+    # 正常构建 8-15 分钟；bun install 带 2 次重试（每次上限 10 分钟），故给 60 分钟余量。
+    timeout-minutes: 60
 
     steps:
       - name: Resolve inputs
