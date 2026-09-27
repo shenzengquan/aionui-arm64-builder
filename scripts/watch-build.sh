@@ -84,14 +84,35 @@ for j in d.get('jobs',[]):
 fi
 
 # --- 构建成功，下载产物 ---
-BASE="https://github.com/${OWNER}/${REPO}/releases/download/aionui-arm64-${TAG}"
+# 重要：国内直连 GitHub Release 资产实测只有 ~6 KB/s（221MB 要下 ~9.5 小时）。
+# 走加速镜像实测 ~3 MB/s（约 70 秒）。镜像只做公开资源的转发，不带任何凭据。
+GH_BASE="https://github.com/${OWNER}/${REPO}/releases/download/aionui-arm64-${TAG}"
+MIRROR_PREFIX="${MIRROR_PREFIX:-https://gh-proxy.com/https://github.com}"
+MIRROR_FALLBACK="${MIRROR_FALLBACK:-https://ghproxy.net/https://github.com}"
+
+BASE="${MIRROR_PREFIX}/${OWNER}/${REPO}/releases/download/aionui-arm64-${TAG}"
+
 log "下载 Release 产物到 ${OUT_DIR}"
+log "  通道: ${MIRROR_PREFIX}"
 cd "$OUT_DIR" || exit 1
+
+# 下载单个文件，主镜像失败自动降级到备用镜像
+dl() {
+  local name="$1"
+  if curl -L --fail --retry 3 --retry-delay 3 --retry-all-errors -C - \
+       --connect-timeout 15 -m 3600 -o "$name" "${BASE}/${name}"; then
+    return 0
+  fi
+  log "  主镜像失败，改用备用镜像"
+  curl -L --fail --retry 3 --retry-delay 3 --retry-all-errors -C - \
+       --connect-timeout 15 -m 3600 -o "$name" \
+       "${MIRROR_FALLBACK}/${OWNER}/${REPO}/releases/download/aionui-arm64-${TAG}/${name}"
+}
 
 CODE=$(curl -s -o /dev/null -m 30 -w '%{http_code}' -L -I "${BASE}/aionui-arm64-${TAG}.tar.gz")
 if [ "$CODE" = "200" ]; then
   log "单文件归档模式"
-  curl -L -m 1800 -o "aionui-arm64-${TAG}.tar.gz" "${BASE}/aionui-arm64-${TAG}.tar.gz"
+  dl "aionui-arm64-${TAG}.tar.gz" && log "  下载完成: $(ls -lh "aionui-arm64-${TAG}.tar.gz" | awk '{print $5}')"
 else
   log "分卷模式，逐个下载 part-*"
   for i in 00 01 02 03 04 05 06 07 08 09; do
@@ -99,11 +120,21 @@ else
     C=$(curl -s -o /dev/null -m 30 -w '%{http_code}' -L -I "${BASE}/${P}")
     [ "$C" = "200" ] || break
     log "  下载 ${P}"
-    curl -L -m 1800 -o "${P}" "${BASE}/${P}"
+    dl "${P}"
   done
 fi
 
 curl -s -L -m 60 -o SHA256SUMS "${BASE}/SHA256SUMS" || true
+
+# 有 SHA256SUMS 就顺手校验，避免拿到半截文件还不知道
+if [ -s SHA256SUMS ]; then
+  if sha256sum -c SHA256SUMS >/dev/null 2>&1; then
+    log "SHA256 校验通过 ✅"
+  else
+    log "!! SHA256 校验失败，文件可能不完整（删掉重跑本脚本即可续传）"
+    sha256sum -c SHA256SUMS || true
+  fi
+fi
 
 log "产物清单："
 ls -lh

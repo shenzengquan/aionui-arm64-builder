@@ -42,6 +42,7 @@ node scripts/pack-web-cli.js       → 编译单文件二进制 + 下载 AionCor
 │   ├── docker-compose.yml                  # NAS 侧运行编排
 │   └── .env.example                        # 环境变量模板
 ├── scripts/
+│   ├── nas-fetch-release.sh                # NAS 侧下载 Release 产物（自动走国内加速镜像）
 │   ├── nas-load-and-deploy.sh              # NAS 侧导入脚本（校验 + docker load + 可选 --up）
 │   ├── watch-build.sh                      # 盯梢构建，成功后自动下载 Release 产物
 │   ├── fetch-build-logs.sh                 # 拉取并打印 run 的完整日志（需 admin PAT）
@@ -100,19 +101,29 @@ SHA256SUMS                          # 校验和
 
 ### 第 4 步：传到 NAS 并导入
 
+> **⚠️ 国内网络必看：不要直连 GitHub 下载。**
+> 实测直连 Release 资产（`release-assets.githubusercontent.com`）只有 **~6 KB/s**，
+> 221MB 要下 **约 9.5 小时**；走加速镜像可达 **~3 MB/s，约 70 秒**。
+
 在 NAS 终端里（SSH 或 UGOS 自带终端）：
 
 ```bash
-# 方式 A：NAS 能直连 GitHub
-curl -LO https://github.com/<你的用户名>/aionui-arm64-builder/releases/download/aionui-arm64-2.2.2/aionui-arm64-2.2.2.tar.gz
-curl -LO https://github.com/<你的用户名>/aionui-arm64-builder/releases/download/aionui-arm64-2.2.2/SHA256SUMS
+# 方式 A（推荐）：用仓库里的脚本自动走加速镜像 + 断点续传 + 校验
+./scripts/nas-fetch-release.sh -t 2.2.2 -o /volume1/docker/aionui/dist
 
-# 方式 B：NAS 连不上 GitHub —— 在 Windows 上下好，用 UGOS 文件管理器传上去
+# 方式 B：手动用镜像下载
+curl -L -O https://gh-proxy.com/https://github.com/<你的用户名>/aionui-arm64-builder/releases/download/aionui-arm64-2.2.2/aionui-arm64-2.2.2.tar.gz
+curl -L -O https://gh-proxy.com/https://github.com/<你的用户名>/aionui-arm64-builder/releases/download/aionui-arm64-2.2.2/SHA256SUMS
+
+# 方式 C：在 Windows 上下好（同样走镜像），用 UGOS 文件管理器传上去
 
 # 导入（脚本会先校验架构和 sha256，再 docker load）
-./nas-load-and-deploy.sh ./aionui-arm64-2.2.2.tar.gz
+./scripts/nas-load-and-deploy.sh ./aionui-arm64-2.2.2.tar.gz
 ```
 
+> 镜像前缀可按需替换：`gh-proxy.com`（实测最快）→ `ghproxy.net`（备用）。
+> 这类服务只转发**公开**资源，不要用来传带 token 的私有下载链接。
+>
 > 如果是分卷，把整个目录传给脚本即可：`./nas-load-and-deploy.sh ./dist`
 > 脚本会自动 `cat part-*` 合并。
 
@@ -165,6 +176,30 @@ RK3588 是 **8GB 板载内存、不可扩展**，且大概率还跑着别的 Doc
 
 ## 排查
 
+### 下载产物慢到不可用（国内网络）
+
+症状：`curl` 下载 Release 的 tar.gz，速度只有几 KB/s，进度条显示要几十小时。
+
+原因：GitHub Release 资产实际由 `release-assets.githubusercontent.com` 提供，
+国内直连被严重限速。
+
+实测数据（同一台机器、同一时间）：
+
+| 通道 | 实测速度 | 221MB 耗时 |
+|---|---|---|
+| 直连 `github.com` / `release-assets.githubusercontent.com` | ~6.5 KB/s | ~9.5 小时 |
+| `ghproxy.net` | ~240 KB/s | ~15 分钟 |
+| `gh-proxy.com` | ~3 MB/s | ~70 秒 |
+
+解决：用 `scripts/nas-fetch-release.sh`，它会自动按 `gh-proxy.com` → `ghproxy.net` → 直连
+的顺序降级，并支持断点续传和 sha256 校验。
+
+> 注意：`ghproxy.net` 之外的几个常见镜像（`ghfast.top`、`gh.llkk.cc`、`github.moeyy.xyz`）
+> 在测试时**不可达**，不要盲试。
+>
+> 另一个备选是走 GHCR：把镜像 push 到 GHCR，NAS 上 `docker pull ghcr.nju.edu.cn/<路径>:<tag>`。
+> 南京大学 GHCR 镜像 `ghcr.nju.edu.cn` 实测可达（`/v2/` 返回 200）。
+
 ### 构建卡死不动（长时间 in_progress）
 
 症状：`Build ARM64 image` 步骤跑了几十分钟甚至几小时仍不结束，Release 不出现。
@@ -173,10 +208,17 @@ RK3588 是 **8GB 板载内存、不可扩展**，且大概率还跑着别的 Doc
 
 | 措施 | 作用 |
 |---|---|
-| `timeout-minutes: 45`（job 级） | 卡死 45 分钟自动失败，不再无限干等 |
+| `timeout-minutes: 60`（job 级） | 卡死 60 分钟自动失败，不再无限干等 |
 | `--progress=plain` + 逐行时间戳 | 关掉折叠进度条，实时看到停在哪个 `RUN` |
 | `Network reachability check` 步骤 | 构建前先探 npm/github/AionCore 三个关键端点 |
 | Dockerfile 内 `timeout 300/900` | `git clone` / `bun install` / `bun run package` / `pack-web-cli.js` 各自限时 |
+| `ENV CI=true` | **关键** —— 让上游 `postinstall.js` 走预编译分支，不触发 ARM64 上会卡死的本地重编译 |
+
+> `ENV CI=true` 这一条最容易被忽略：`docker build` **不会继承宿主机的环境变量**，
+> 容器里 `CI` 是空的，上游 `scripts/postinstall.js` 就会走
+> `bunx electron-builder install-app-deps` 的重量级本地重编译分支 ——
+> 在 ARM64 上表现为**静默挂起、无任何输出**（GitHub 侧日志 API 都返回 `BlobNotFound`，
+> 因为 job 压根没产生输出）。
 
 定位卡点最直接的方式 —— **在本地拉日志**：
 
