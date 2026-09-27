@@ -42,6 +42,9 @@ jobs:
     # ARM64 原生 runner，公开仓库免费不限量
     runs-on: ubuntu-24.04-arm
 
+    # 硬性超时：卡死自动失败，不干等。正常构建 8-15 分钟，给 45 分钟余量。
+    timeout-minutes: 45
+
     steps:
       - name: Resolve inputs
         id: vars
@@ -73,16 +76,45 @@ jobs:
           docker version
 
       # ----------------------------------------------------------------
+      # 0) 出网连通性体检（构建前先探路，避免卡死时无从判断）
+      # ----------------------------------------------------------------
+      - name: Network reachability check
+        run: |
+          set -ux
+          echo "=== 关键依赖出网探测 ==="
+          for url in \
+            https://registry.npmjs.org/ \
+            https://github.com/iOfficeAI/AionUi \
+            https://api.github.com/repos/iOfficeAI/AionCore/releases/latest
+          do
+            code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$url" || echo "TIMEOUT")
+            echo "  $url -> $code"
+          done
+          echo "=== DNS ==="
+          getent hosts registry.npmjs.org github.com api.github.com || true
+
+      # ----------------------------------------------------------------
       # 1) 构建 Docker 镜像（ARM64 原生，无 QEMU）
+      #   --progress=plain : 关掉折叠式进度条，实时逐行打印每条 RUN 的完整输出
+      #                      （卡住时能直接看出停在哪一步，比如 bun install）
+      #   时间戳前缀       : 每行带时间，便于判断在哪一步耗时异常
       # ----------------------------------------------------------------
       - name: Build ARM64 image
+        env:
+          DOCKER_BUILDKIT: "1"
+          BUILDKIT_PROGRESS: plain
         run: |
+          set -o pipefail
           docker build \
+            --progress=plain \
             --platform linux/arm64 \
             --build-arg AIONUI_VERSION=${{ steps.vars.outputs.aionui_version }} \
+            --build-arg BUILDTIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             -t ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }} \
             -f Dockerfile \
-            .
+            . 2>&1 | while IFS= read -r line; do
+              printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$line"
+            done
 
       - name: Smoke test image
         run: |

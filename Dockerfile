@@ -46,25 +46,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # 拉取指定版本的源码。--depth 1 只取该 tag 的快照，不拉 4400+ commits 历史
-RUN git clone --depth 1 --branch "${AIONUI_VERSION}" \
-      https://github.com/iOfficeAI/AionUi.git src
+# 加超时与重试：runner 出网偶发抽风时会卡死在这里
+RUN set -eux; \
+    for i in 1 2 3; do \
+      timeout 300 git clone --depth 1 --branch "${AIONUI_VERSION}" \
+        https://github.com/iOfficeAI/AionUi.git src && break; \
+      echo "!! git clone 第 ${i} 次失败，10s 后重试"; \
+      rm -rf src; sleep 10; \
+    done; \
+    test -d src || { echo "!! git clone 三次均失败"; exit 1; }
 
 WORKDIR /build/src
 
 # 安装依赖。--frozen-lockfile 保证与上游 lockfile 一致，避免依赖漂移
-RUN bun install --frozen-lockfile
+# timeout 900: 超过 15 分钟未完成即视为卡死，直接失败而不是无限等待
+RUN set -eux; \
+    timeout 900 bun install --frozen-lockfile || { \
+      echo "::error::bun install 超时或失败（15 分钟上限）"; exit 1; }
 
 # 前端 SPA 打包 -> out/renderer
-RUN bun run package
+RUN set -eux; \
+    timeout 900 bun run package || { \
+      echo "::error::bun run package 超时或失败（15 分钟上限）"; exit 1; }
 
 # 打包 web-cli：
 #   1) prepareAioncore() 下载 AionCore aarch64 预编译包
 #   2) bun build --compile --target=bun-linux-arm64 编译单文件二进制
 #   3) 合并 out/renderer + bundled-aioncore/linux-arm64
 #   4) 产出 dist-web-cli/aionui-web-<version>-linux-arm64.tar.gz + .sha256
+# timeout 900: prepareAioncore 要下载 AionCore 产物，网络卡住时会一直挂着
 ENV PACK_PLATFORM=linux
 ENV PACK_ARCH=arm64
-RUN node scripts/pack-web-cli.js
+RUN set -eux; \
+    timeout 900 node scripts/pack-web-cli.js || { \
+      echo "::error::pack-web-cli.js 超时或失败（15 分钟上限），检查 AionCore 下载地址是否可达"; exit 1; }
 
 # 归一化产物名，后续阶段不依赖具体版本号
 RUN set -eux; \

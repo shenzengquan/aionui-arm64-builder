@@ -42,7 +42,10 @@ node scripts/pack-web-cli.js       → 编译单文件二进制 + 下载 AionCor
 │   ├── docker-compose.yml                  # NAS 侧运行编排
 │   └── .env.example                        # 环境变量模板
 ├── scripts/
-│   └── nas-load-and-deploy.sh              # NAS 侧导入脚本（校验 + docker load）
+│   ├── nas-load-and-deploy.sh              # NAS 侧导入脚本（校验 + docker load + 可选 --up）
+│   ├── watch-build.sh                      # 盯梢构建，成功后自动下载 Release 产物
+│   ├── fetch-build-logs.sh                 # 拉取并打印 run 的完整日志（需 admin PAT）
+│   └── push-to-github.sh                   # 初始化仓库并推送
 ├── .gitattributes                          # 强制 .sh/.yml 用 LF
 ├── .gitignore
 └── .dockerignore
@@ -161,6 +164,32 @@ RK3588 是 **8GB 板载内存、不可扩展**，且大概率还跑着别的 Doc
 ---
 
 ## 排查
+
+### 构建卡死不动（长时间 in_progress）
+
+症状：`Build ARM64 image` 步骤跑了几十分钟甚至几小时仍不结束，Release 不出现。
+
+工作流已做的防御：
+
+| 措施 | 作用 |
+|---|---|
+| `timeout-minutes: 45`（job 级） | 卡死 45 分钟自动失败，不再无限干等 |
+| `--progress=plain` + 逐行时间戳 | 关掉折叠进度条，实时看到停在哪个 `RUN` |
+| `Network reachability check` 步骤 | 构建前先探 npm/github/AionCore 三个关键端点 |
+| Dockerfile 内 `timeout 300/900` | `git clone` / `bun install` / `bun run package` / `pack-web-cli.js` 各自限时 |
+
+定位卡点最直接的方式 —— **在本地拉日志**：
+
+```bash
+# 需要一个具备 repo admin 权限的 PAT（classic，scope: repo + workflow）
+GH_TOKEN=ghp_xxxx ./scripts/fetch-build-logs.sh 36307008891 "Build ARM64 image"
+```
+
+> GitHub 的 run logs API 要求 admin 权限，普通 connector 凭据会返回
+> `403 Must have admin rights to Repository`，所以必须显式传 PAT。
+
+如果日志显示卡在 `bun install`，通常是 npm registry 偶发抽风 —— 重跑即可。
+如果卡在 `pack-web-cli.js`，检查 AionCore 的 Release 资产命名是否变化。
 
 ### 构建阶段失败
 
