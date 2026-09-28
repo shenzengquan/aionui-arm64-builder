@@ -163,8 +163,70 @@ df -h | grep -E "volume|mnt"
 ### 内存分配
 
 RK3588 是 **8GB 板载内存、不可扩展**，且大概率还跑着别的 Docker 服务。
-`docker-compose.yml` 里给了 AionUi **3GB 上限 + 512MB 保底**。
-如果 NAS 上还有别的大内存服务，把这个上限再往下调。
+`docker-compose.yml` 里给了 AionUi **2GB 上限 + 512MB 保底**。
+
+> **为什么是 2G 而不是 3G**：实测 NAS 上 `free -h` 常常只剩 3~4G available，
+> 且 swap 已经在用（`Swap used ≈ 2.5G`）。给太大反而更容易触发系统级 OOM，
+> 把别的容器一起拖死。AionUi 空载实测只占 ~75MB，2G 上限绰绰有余。
+> 如果 NAS 上还有别的大内存服务，可以进一步调到 `1.5g`。
+
+### ⚠️ 运行用户必须是 root（绿联 UGOS 特有问题）
+
+这是**本项目在绿联 NAS 上最容易踩的坑**，症状具有误导性：
+
+```
+[aionui-web] fatal: EACCES: permission denied, mkdir '/data/logs'
+```
+
+看起来是权限不足，但 `ls -ld` 会发现数据目录已经是 **`drwxrwxrwx`（777）**，
+容器内 `touch` 测试文件**成功**，只有 `mkdir` 被拒。
+
+**根因**：绿联 UGOS 的卷用 `ugacl` 挂载：
+
+```
+/dev/mapper/ug_...-volume1 on /data type btrfs (rw,...,ugacl,...)
+```
+
+`ugacl` **不按 POSIX 的 other 位判定写权限**，只认属主和显式 ACL 条目。
+目录属主是 `18380401399:admin`（uid **1001**），而镜像内建的非 root 用户是
+uid **1000** → 既不是属主，又没有 ACL 条目 → `mkdir` 被拒。
+（`touch` 能过是因为它走的是另一条判定路径。）
+
+**为什么不能 chown 解决**：NAS 上普通用户执行
+`chown -R 1000:1000 <dir>` 会直接报
+`chown: changing ownership ...: Operation not permitted`，
+而 `sudo` 需要密码（非免密）。
+
+**解决**：在 compose 里显式指定 `user: "0:0"`。
+
+```yaml
+user: "0:0"     # 见 docker-compose.yml 的注释说明
+```
+
+> 这与 NAS 上既有的 `czyt/aionui` 容器做法一致 —— 它同样以 root 运行
+> （`docker inspect` 的 `.Config.User` 为空 = uid 0）。
+>
+> 安全性权衡：镜像本身**设计了**非 root（uid 1000）运行，这是更好的做法；
+> 但在 UGOS 的限制下，要么用 root，要么得先拿到 root 权限 chown。
+> 容器只挂载 `/data` 一个目录、只暴露一个端口，风险面可控。
+
+**判断当前容器是不是踩了这个坑**：
+
+```bash
+docker inspect aionui --format '{{.Config.User}}'          # 应为 0:0
+docker logs aionui 2>&1 | grep EACCES                       # 应为空
+```
+
+### 端口冲突检查
+
+绿联 NAS 上很可能已经跑着第三方 AionUi 镜像（如 `czyt/aionui`）。
+部署前先确认：
+
+```bash
+docker ps --format 'table {{.Names}}\t{{.Ports}}' | grep -E 'aionui|3000'
+```
+
+两者可以并存（映射到不同宿主端口即可），但**数据目录不要共用**。
 
 ### 架构校验
 
@@ -199,6 +261,36 @@ RK3588 是 **8GB 板载内存、不可扩展**，且大概率还跑着别的 Doc
 >
 > 另一个备选是走 GHCR：把镜像 push 到 GHCR，NAS 上 `docker pull ghcr.nju.edu.cn/<路径>:<tag>`。
 > 南京大学 GHCR 镜像 `ghcr.nju.edu.cn` 实测可达（`/v2/` 返回 200）。
+
+### 忘记 / 拿不到管理员密码
+
+首次启动会生成随机密码并打印在日志里：
+
+```bash
+docker logs aionui 2>&1 | grep -A2 "Generated initial admin password"
+```
+
+**如果日志已经滚掉、或者拿不到密码**，用 `resetpass` 重置：
+
+```bash
+# ⚠️ 必须先停容器！运行中执行会失败
+docker compose stop
+
+docker run --rm --user 0:0 \
+  -v /volume1/docker/aionui/data:/data \
+  -e AIONUI_DATA_DIR=/data \
+  --entrypoint /app/aionui-web \
+  aionui:2.2.2 resetpass
+
+docker compose start
+```
+
+> **为什么必须先停容器**：AionUi 对数据目录有 `instance_guard` 独占锁。
+> 在运行中执行 `resetpass`，它会试图再起一个 aioncore，
+> 但拿不到锁 → 反复重试 `BOOTSTRAP_PEER_ALREADY_RUNNING` →
+> 最终 `fatal: aioncore exited before health check passed`，
+> **重置失败且看不出原因**。停容器后执行即可，输出里的
+> `new password: xxxxx` 就是新密码。
 
 ### 构建卡死不动（长时间 in_progress）
 

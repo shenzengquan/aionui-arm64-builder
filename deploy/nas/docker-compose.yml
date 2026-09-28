@@ -20,6 +20,18 @@ services:
     # 离线部署：镜像本地已有，禁止尝试拉取
     pull_policy: never
 
+    # -----------------------------------------------------------------------
+    # 运行用户：必须用 root（0:0）
+    # -----------------------------------------------------------------------
+    # 镜像内建的非 root 用户是 uid=1000，但绿联 UGOS 的卷挂 `ugacl` 模块，
+    # 普通用户无法 chown 宿主机目录到 1000（报 Operation not permitted）。
+    # 若不以 root 跑，容器会启动失败：
+    #     [aionui-web] fatal: EACCES: permission denied, mkdir '/data/logs'
+    # 说明：目录本身是 777，但 ugacl 不按 other 位判定写权限，
+    # 与现有 czyt_aionui-1 容器的做法保持一致（同样以 root 运行）。
+    # -----------------------------------------------------------------------
+    user: "0:0"
+
     ports:
       # 左侧为 NAS 暴露端口，可按需改
       - "${AIONUI_PORT:-3000}:3000"
@@ -39,12 +51,14 @@ services:
     # 内存上限：RK3588 是 8GB 板载内存不可扩展。
     # 注意：deploy.resources.limits 只在 Swarm 模式生效，
     # 单机 docker compose 必须用 mem_limit。两个都写，兼容两种部署方式。
-    mem_limit: ${AIONUI_MEM_LIMIT:-3g}
-    memswap_limit: ${AIONUI_MEM_LIMIT:-3g}
+    # 默认 2g（而非 3g）：实测 NAS 上可用内存常只剩 3~3.5G（还有 swap 在用），
+    # 给太大反而容易触发系统级 OOM，把别的容器一起拖死。
+    mem_limit: ${AIONUI_MEM_LIMIT:-2g}
+    memswap_limit: ${AIONUI_MEM_LIMIT:-2g}
     deploy:
       resources:
         limits:
-          memory: ${AIONUI_MEM_LIMIT:-3g}
+          memory: ${AIONUI_MEM_LIMIT:-2g}
         reservations:
           memory: 512m
 
